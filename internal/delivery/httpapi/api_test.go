@@ -8,10 +8,11 @@ import (
 	"testing"
 
 	"finfe/internal/config"
+	"finfe/internal/infrastructure/mongodb"
 )
 
 func TestFinancialRoutesRequireAuthentication(t *testing.T) {
-	a := New(config.Config{JWTSecret: []byte("test-secret-test-secret-test-secret"), AppURL: "http://localhost:3000"}, nil, nil, slog.Default())
+	a := NewMongo(config.Config{JWTSecret: []byte("test-secret-test-secret-test-secret"), AppURL: "http://localhost:3000"}, &mongodb.Database{}, nil, slog.Default())
 	h := a.Router()
 	for _, path := range []string{"/api/v1/expenses", "/api/v1/expenses/summary", "/api/v1/income", "/api/v1/budgets", "/api/v1/savings", "/api/v1/goals", "/api/v1/reports/monthly", "/api/v1/financial-health/overview"} {
 		t.Run(path, func(t *testing.T) {

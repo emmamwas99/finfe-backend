@@ -13,8 +13,8 @@ import (
 	"finfe/internal/application/recurring"
 	"finfe/internal/config"
 	"finfe/internal/delivery/httpapi"
-	"finfe/internal/infrastructure/database"
 	"finfe/internal/infrastructure/email"
+	"finfe/internal/infrastructure/mongodb"
 )
 
 func main() {
@@ -26,28 +26,26 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	pool, err := database.Open(ctx, cfg.DatabaseURL, cfg.DatabaseMaxConns)
+	db, err := mongodb.Open(ctx, cfg.MongoDBURI, cfg.MongoDBDatabase, cfg.MongoDBMaxPool)
 	if err != nil {
 		log.Error("database", "error", err)
 		os.Exit(1)
 	}
-	defer pool.Close()
-	if cfg.MigrateOnStart {
-		if err := database.Migrate(pool, "up"); err != nil {
-			log.Error("migrate", "error", err)
-			os.Exit(1)
-		}
+	defer db.Close(context.Background())
+	if err := db.EnsureIndexes(ctx); err != nil {
+		log.Error("mongodb indexes", "error", err)
+		os.Exit(1)
 	}
 	var mail email.Mailer = &email.Log{Logger: log}
 	if cfg.MailDriver == "smtp" {
 		mail = email.SMTP{Host: cfg.SMTPHost, Port: cfg.SMTPPort, Username: cfg.SMTPUsername, Password: cfg.SMTPPassword, From: cfg.MailFrom}
 	}
-	api := httpapi.New(cfg, pool, mail, log)
+	api := httpapi.NewMongo(cfg, db, mail, log)
 	go func() {
 		ticker := time.NewTicker(time.Hour)
 		defer ticker.Stop()
 		for {
-			if err := recurring.Run(ctx, pool, time.Now()); err != nil {
+			if err := recurring.RunMongo(ctx, db, time.Now()); err != nil {
 				log.Error("recurring job", "error", err)
 			}
 			select {

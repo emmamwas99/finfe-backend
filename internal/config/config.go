@@ -16,10 +16,10 @@ type Config struct {
 	HTTPAddr string
 	AppURL   string // the web app's public URL (email links, Paystack callback)
 
-	DatabaseURL      string
-	DatabaseMaxConns int32
-	MigrateOnStart   bool
-	RedisURL         string
+	MongoDBURI      string
+	MongoDBDatabase string
+	MongoDBMaxPool  uint64
+	RedisURL        string
 
 	JWTSecret       []byte
 	AccessTokenTTL  time.Duration
@@ -57,9 +57,9 @@ func Load() (Config, error) {
 		Env:                      env,
 		HTTPAddr:                 get("HTTP_ADDR", ":8080"),
 		AppURL:                   strings.TrimRight(get("APP_URL", "http://localhost:3000"), "/"),
-		DatabaseURL:              get("DATABASE_URL", "postgres://finfe:finfe@localhost:5432/finfe?sslmode=disable"),
-		DatabaseMaxConns:         int32(getInt("DATABASE_MAX_CONNS", 20)),
-		MigrateOnStart:           getBool("MIGRATE_ON_START", !prod),
+		MongoDBURI:               get("MONGODB_URI", "mongodb://localhost:27017/?directConnection=true&replicaSet=rs0"),
+		MongoDBDatabase:          get("MONGODB_DATABASE", "finfe"),
+		MongoDBMaxPool:           uint64(max(1, getInt("MONGODB_MAX_POOL_SIZE", 20))),
 		RedisURL:                 get("REDIS_URL", ""),
 		JWTSecret:                []byte(get("JWT_SECRET", "")),
 		AccessTokenTTL:           getDuration("ACCESS_TOKEN_TTL", 15*time.Minute),

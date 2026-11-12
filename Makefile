@@ -1,6 +1,6 @@
-.PHONY: dev build test race vet fmt sqlc migrate-up migrate-down up down
+.PHONY: dev build test race vet fmt mongo-setup up down
 dev:
-	go run ./cmd/api
+	./scripts/dev.sh
 build:
 	go build ./cmd/api
 test:
@@ -11,12 +11,8 @@ vet:
 	go vet ./...
 fmt:
 	go fmt ./...
-sqlc:
-	sqlc generate
-migrate-up:
-	go run ./cmd/migrate up
-migrate-down:
-	go run ./cmd/migrate down
+mongo-setup:
+	go run ./cmd/mongo-setup
 up:
 	docker compose up --build
 down:

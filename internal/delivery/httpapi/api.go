@@ -14,26 +14,22 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"finfe/internal/config"
 	"finfe/internal/infrastructure/email"
-	"finfe/internal/infrastructure/persistence/store"
 	ratelimit "finfe/internal/infrastructure/redis"
 	"finfe/internal/infrastructure/security"
 )
 
 type API struct {
 	cfg     config.Config
-	db      *pgxpool.Pool
-	q       *store.Queries
 	mail    email.Mailer
 	log     *slog.Logger
 	limiter ratelimit.Limiter
 }
 
-func New(cfg config.Config, db *pgxpool.Pool, mail email.Mailer, log *slog.Logger) *API {
-	a := &API{cfg: cfg, db: db, q: store.New(db), mail: mail, log: log, limiter: ratelimit.NewMemoryLimiter()}
+func newBase(cfg config.Config, mail email.Mailer, log *slog.Logger) *API {
+	a := &API{cfg: cfg, mail: mail, log: log, limiter: ratelimit.NewMemoryLimiter()}
 	if cfg.RedisURL != "" {
 		if c, err := ratelimit.NewClient(context.Background(), cfg.RedisURL); err == nil {
 			a.limiter = ratelimit.RedisLimiter{C: c}
@@ -44,85 +40,10 @@ func New(cfg config.Config, db *pgxpool.Pool, mail email.Mailer, log *slog.Logge
 	return a
 }
 
-func (a *API) Router() http.Handler {
-	r := chi.NewRouter()
-	r.Use(middleware.RequestID, a.logRequests, middleware.Recoverer)
-	if a.cfg.TrustProxy {
-		r.Use(middleware.RealIP)
-	}
-	r.Use(a.cors, a.originGuard)
-	r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
-		respond(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
-	r.Get("/ready", func(w http.ResponseWriter, req *http.Request) {
-		ctx, cancel := context.WithTimeout(req.Context(), 2*time.Second)
-		defer cancel()
-		if err := a.db.Ping(ctx); err != nil {
-			fail(w, http.StatusServiceUnavailable, "unavailable", "Database is unavailable")
-			return
-		}
-		respond(w, http.StatusOK, map[string]string{"status": "ready"})
-	})
-	r.Route("/api/v1", func(r chi.Router) {
-		r.Post("/billing/webhook", a.billingWebhook)
-		r.Post("/auth/register", a.register)
-		r.Post("/auth/login", a.login)
-		r.Post("/auth/refresh", a.refresh)
-		r.Post("/auth/forgot-password", a.forgotPassword)
-		r.Post("/auth/recovery-session", a.recoverySession)
-		r.Post("/auth/verify-email", a.verifyEmail)
-		r.Group(func(r chi.Router) {
-			r.Use(a.auth)
-			r.Post("/auth/logout", a.logout)
-			r.Post("/auth/password", a.changePassword)
-			r.Get("/auth/sessions", a.listSessions)
-			r.Delete("/auth/sessions/{id}", a.revokeSession)
-			r.Get("/users/me", a.me)
-			r.Patch("/users/me", a.updateMe)
-			r.Delete("/users/me", a.deleteMe)
-			r.Get("/vault", a.getVault)
-			r.Post("/vault", a.createVault)
-			r.Patch("/vault", a.saveVault)
-			r.Get("/billing/subscription", a.billingSubscription)
-			r.Get("/billing/payments", a.billingPayments)
-			r.Post("/billing/checkout", a.billingCheckout)
-			r.Post("/billing/verify", a.billingVerify)
-			r.Get("/billing/manage", a.billingManage)
-			r.Get("/billing/demo/{reference}", a.billingDemoInfo)
-			r.Post("/billing/demo/{reference}", a.billingDemoComplete)
-			a.financeRoutes(r)
-		})
-	})
-	return r
-}
-
 type principalKey struct{}
 
 func principal(r *http.Request) security.Principal {
 	return r.Context().Value(principalKey{}).(security.Principal)
-}
-
-func (a *API) auth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token := ""
-		if c, err := r.Cookie("finfe_access"); err == nil {
-			token = c.Value
-		}
-		if token == "" && strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
-			token = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		}
-		p, err := security.ParseAccessToken(a.cfg.JWTSecret, token)
-		if err != nil {
-			fail(w, 401, "unauthenticated", "Sign in again")
-			return
-		}
-		s, err := a.q.GetActiveSession(r.Context(), p.SessionID)
-		if err != nil || s.UserID != p.UserID {
-			fail(w, 401, "unauthenticated", "Session expired")
-			return
-		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), principalKey{}, p)))
-	})
 }
 
 func (a *API) allowedOrigin(origin string) bool {
@@ -200,10 +121,6 @@ func fail(w http.ResponseWriter, code int, key, msg string) {
 	respond(w, code, map[string]any{"error": map[string]string{"code": key, "message": msg}})
 }
 func badJSON(w http.ResponseWriter, err error) { fail(w, 400, "invalid_request", err.Error()) }
-func serverError(a *API, w http.ResponseWriter, err error) {
-	a.log.Error("request failed", "error", err)
-	fail(w, 500, "internal_error", "Something went wrong")
-}
 func paramID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
@@ -229,10 +146,4 @@ func (a *API) logRequests(next http.Handler) http.Handler {
 		next.ServeHTTP(ww, r)
 		a.log.Info("http request", "request_id", middleware.GetReqID(r.Context()), "method", r.Method, "path", r.URL.Path, "status", ww.Status(), "duration_ms", time.Since(start).Milliseconds())
 	})
-}
-
-func (a *API) audit(r *http.Request, uid uuid.UUID, action string) {
-	if err := a.q.InsertAuditEvent(r.Context(), store.InsertAuditEventParams{UserID: &uid, Action: action, Ip: r.RemoteAddr, UserAgent: r.UserAgent(), Metadata: []byte("{}")}); err != nil {
-		a.log.Error("audit event failed", "action", action, "error", err)
-	}
 }
