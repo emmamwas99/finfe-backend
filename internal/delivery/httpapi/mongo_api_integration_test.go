@@ -11,17 +11,146 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"go.mongodb.org/mongo-driver/v2/bson"
 
 	"finfe/internal/config"
 	"finfe/internal/infrastructure/email"
 	"finfe/internal/infrastructure/mongodb"
 	"finfe/internal/infrastructure/paystack"
 )
+
+func TestMongoAPIRegisterQueuesConfirmationIntegration(t *testing.T) {
+	uri := os.Getenv("MONGODB_TEST_URI")
+	if uri == "" {
+		t.Skip("set MONGODB_TEST_URI to run the MongoDB integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	db, err := mongodb.Open(ctx, uri, "finfe_test_"+uuid.NewString()[:12], 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.DB.Drop(context.Background()); _ = db.Close(context.Background()) })
+	if err := db.EnsureIndexes(ctx); err != nil {
+		t.Fatal(err)
+	}
+	transport := &email.Log{}
+	mailQueue := email.NewOutbox(db.DB, transport, []byte("test-secret-test-secret-test-secret"), slog.Default())
+	cfg := config.Config{JWTSecret: []byte("test-secret-test-secret-test-secret"), AppURL: "http://localhost:3000", CORSOrigins: []string{"http://localhost:3000"}, AccessTokenTTL: 15 * time.Minute, RefreshTokenTTL: 24 * time.Hour, TrialDays: 14, RequireEmailVerification: true}
+	h := NewMongo(cfg, db, mailQueue, slog.Default()).Router()
+	address := "queue-" + uuid.NewString() + "@example.invalid"
+	payload, _ := json.Marshal(map[string]string{"email": address, "password": "long-test-password", "name": "Queue"})
+	req := httptest.NewRequest("POST", "/api/v1/auth/register", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://localhost:3000")
+	w := httptest.NewRecorder()
+	start := time.Now()
+	h.ServeHTTP(w, req)
+	t.Logf("registration response time with queued email: %s", time.Since(start))
+	if w.Code != 201 || len(transport.Sent()) != 0 {
+		t.Fatalf("registration should return before delivery: status=%d mails=%d body=%s", w.Code, len(transport.Sent()), w.Body.String())
+	}
+	count, err := db.DB.Collection("mail_outbox").CountDocuments(ctx, bson.M{})
+	if err != nil || count != 1 {
+		t.Fatalf("confirmation was not queued: count=%d error=%v", count, err)
+	}
+	go mailQueue.Run(ctx)
+	deadline := time.After(10 * time.Second)
+	for len(transport.Sent()) == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("queued confirmation was not delivered")
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	if transport.Sent()[0].To != address {
+		t.Fatal("queued confirmation went to wrong address")
+	}
+	for {
+		count, err = db.DB.Collection("mail_outbox").CountDocuments(ctx, bson.M{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if count == 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("delivered confirmation was not removed from queue")
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+func TestMongoAPIResendVerificationIntegration(t *testing.T) {
+	uri := os.Getenv("MONGODB_TEST_URI")
+	if uri == "" {
+		t.Skip("set MONGODB_TEST_URI to run the MongoDB integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	db, err := mongodb.Open(ctx, uri, "finfe_test_"+uuid.NewString()[:12], 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.DB.Drop(context.Background()); _ = db.Close(context.Background()) })
+	if err := db.EnsureIndexes(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mailer := &email.Log{}
+	cfg := config.Config{JWTSecret: []byte("test-secret-test-secret-test-secret"), AppURL: "http://localhost:3000", CORSOrigins: []string{"http://localhost:3000"}, AccessTokenTTL: 15 * time.Minute, RefreshTokenTTL: 24 * time.Hour, TrialDays: 14, RequireEmailVerification: true}
+	h := NewMongo(cfg, db, mailer, slog.Default()).Router()
+	request := func(path string, body any) *httptest.ResponseRecorder {
+		t.Helper()
+		payload, _ := json.Marshal(body)
+		req := httptest.NewRequest("POST", path, bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", "http://localhost:3000")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		return w
+	}
+	address := "verify-" + uuid.NewString() + "@example.invalid"
+	w := request("/api/v1/auth/register", map[string]any{"email": address, "password": "long-test-password", "name": "Verify"})
+	if w.Code != 201 || !bytes.Contains(w.Body.Bytes(), []byte(`"needsConfirmation":true`)) || len(mailer.Sent()) != 1 {
+		t.Fatalf("registration: status=%d body=%s mails=%d", w.Code, w.Body.String(), len(mailer.Sent()))
+	}
+	w = request("/api/v1/auth/login", map[string]any{"email": address, "password": "long-test-password"})
+	if w.Code != 403 || !bytes.Contains(w.Body.Bytes(), []byte(`"email_unverified"`)) {
+		t.Fatalf("unverified login: %d %s", w.Code, w.Body.String())
+	}
+	w = request("/api/v1/auth/resend-verification", map[string]any{"email": "unknown@example.invalid"})
+	if w.Code != 200 || len(mailer.Sent()) != 1 {
+		t.Fatalf("unknown account resend: status=%d mails=%d", w.Code, len(mailer.Sent()))
+	}
+	w = request("/api/v1/auth/resend-verification", map[string]any{"email": address})
+	if w.Code != 200 || len(mailer.Sent()) != 2 {
+		t.Fatalf("existing account resend: status=%d mails=%d", w.Code, len(mailer.Sent()))
+	}
+	parts := strings.SplitN(mailer.Sent()[1].Body, "?token=", 2)
+	if len(parts) != 2 {
+		t.Fatal("resend message has no confirmation token")
+	}
+	token := strings.SplitN(parts[1], "\n", 2)[0]
+	w = request("/api/v1/auth/verify-email", map[string]any{"token": token})
+	if w.Code != 200 {
+		t.Fatalf("verify: %d %s", w.Code, w.Body.String())
+	}
+	w = request("/api/v1/auth/login", map[string]any{"email": address, "password": "long-test-password"})
+	if w.Code != 200 {
+		t.Fatalf("verified login: %d %s", w.Code, w.Body.String())
+	}
+	w = request("/api/v1/auth/resend-verification", map[string]any{"email": address})
+	if w.Code != 200 || len(mailer.Sent()) != 2 {
+		t.Fatalf("verified account resend: status=%d mails=%d", w.Code, len(mailer.Sent()))
+	}
+}
 
 func TestMongoAPIAuthAndVaultIntegration(t *testing.T) {
 	uri := os.Getenv("MONGODB_TEST_URI")
@@ -30,7 +159,7 @@ func TestMongoAPIAuthAndVaultIntegration(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	db, err := mongodb.Open(ctx, uri, "finfe_test_"+uuid.NewString(), 5)
+	db, err := mongodb.Open(ctx, uri, "finfe_test_"+uuid.NewString()[:12], 5)
 	if err != nil {
 		t.Fatal(err)
 	}

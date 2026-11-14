@@ -3,10 +3,17 @@
 package email
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
+	"mime/quotedprintable"
+	"net"
+	"net/mail"
 	"net/smtp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,31 +29,126 @@ type Mailer interface {
 	Send(ctx context.Context, m Message) error
 }
 
-// SMTP sends through an SMTP relay with STARTTLS (e.g. Resend, Brevo, Postmark, SES).
+// SMTP sends through an authenticated relay using implicit TLS or STARTTLS.
 type SMTP struct {
 	Host, Username, Password, From string
 	Port                           int
+	Secure                         bool        // implicit TLS, normally port 465
+	tlsConfig                      *tls.Config // test-only trust roots; production uses system roots
 }
 
-func (s SMTP) Send(_ context.Context, m Message) error {
-	addr := fmt.Sprintf("%s:%d", s.Host, s.Port)
-	var auth smtp.Auth
+func (s SMTP) connect(ctx context.Context) (*smtp.Client, error) {
+	addr := net.JoinHostPort(s.Host, strconv.Itoa(s.Port))
+	conn, err := (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	failed := true
+	defer func() {
+		if failed {
+			_ = conn.Close()
+		}
+	}()
+	deadline := time.Now().Add(30 * time.Second)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		return nil, err
+	}
+	tlsConfig := &tls.Config{ServerName: s.Host, MinVersion: tls.VersionTLS12}
+	if s.tlsConfig != nil {
+		tlsConfig = s.tlsConfig.Clone()
+	}
+	if tlsConfig.ServerName == "" {
+		tlsConfig.ServerName = s.Host
+	}
+	if tlsConfig.MinVersion == 0 {
+		tlsConfig.MinVersion = tls.VersionTLS12
+	}
+	if s.Secure {
+		secure := tls.Client(conn, tlsConfig)
+		if err := secure.HandshakeContext(ctx); err != nil {
+			return nil, err
+		}
+		conn = secure
+	}
+	client, err := smtp.NewClient(conn, s.Host)
+	if err != nil {
+		return nil, err
+	}
+	if !s.Secure {
+		if ok, _ := client.Extension("STARTTLS"); !ok {
+			_ = client.Close()
+			return nil, errors.New("SMTP server does not offer STARTTLS")
+		}
+		if err := client.StartTLS(tlsConfig); err != nil {
+			_ = client.Close()
+			return nil, err
+		}
+	}
 	if s.Username != "" {
-		auth = smtp.PlainAuth("", s.Username, s.Password, s.Host)
+		if err := client.Auth(smtp.PlainAuth("", s.Username, s.Password, s.Host)); err != nil {
+			_ = client.Close()
+			return nil, err
+		}
 	}
-	msg := strings.Join([]string{
-		"From: " + s.From, "To: " + m.To, "Subject: " + m.Subject,
-		"Date: " + time.Now().Format(time.RFC1123Z),
-		"MIME-Version: 1.0", "Content-Type: text/plain; charset=UTF-8", "", m.Body,
-	}, "\r\n")
-	return smtp.SendMail(addr, auth, extractAddress(s.From), []string{m.To}, []byte(msg))
+	failed = false
+	return client, nil
 }
 
-func extractAddress(from string) string {
-	if i := strings.Index(from, "<"); i >= 0 {
-		return strings.Trim(from[i:], "<>")
+func (s SMTP) Send(ctx context.Context, m Message) error {
+	from, err := mail.ParseAddress(s.From)
+	if err != nil {
+		return fmt.Errorf("invalid mail sender: %w", err)
 	}
-	return from
+	to, err := mail.ParseAddress(m.To)
+	if err != nil {
+		return fmt.Errorf("invalid mail recipient: %w", err)
+	}
+	if strings.ContainsAny(m.Subject, "\r\n") {
+		return errors.New("invalid mail subject")
+	}
+	var body bytes.Buffer
+	encoded := quotedprintable.NewWriter(&body)
+	if _, err := encoded.Write([]byte(m.Body)); err != nil {
+		return err
+	}
+	if err := encoded.Close(); err != nil {
+		return err
+	}
+	message := strings.Join([]string{
+		"From: " + from.String(), "To: " + to.String(), "Subject: " + m.Subject,
+		"Date: " + time.Now().Format(time.RFC1123Z), "Auto-Submitted: auto-generated",
+		"MIME-Version: 1.0", "Content-Type: text/plain; charset=UTF-8",
+		"Content-Transfer-Encoding: quoted-printable", "", body.String(),
+	}, "\r\n")
+	client, err := s.connect(ctx)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	if err := client.Mail(from.Address); err != nil {
+		return err
+	}
+	if err := client.Rcpt(to.Address); err != nil {
+		return err
+	}
+	w, err := client.Data()
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write([]byte(message)); err != nil {
+		_ = w.Close()
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	// DATA completion confirms relay acceptance. A failed QUIT must not cause a retry
+	// that could send the same message twice.
+	_ = client.Quit()
+	return nil
 }
 
 // Log prints emails instead of sending them, and keeps the last ones for tests.

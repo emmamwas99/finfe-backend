@@ -3048,6 +3048,40 @@
         }
       }
     },
+    "/api/v1/auth/resend-verification": {
+      "post": {
+        "summary": "Resend email verification",
+        "description": "Sends a fresh confirmation link when an account exists and still needs verification. The response does not reveal whether the address is registered.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": { "email": { "type": "string", "format": "email" } },
+                "required": ["email"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Request accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "ok": { "type": "boolean" } },
+                  "required": ["ok"]
+                }
+              }
+            }
+          },
+          "400": { "description": "Invalid request", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "429": { "description": "Rate limited", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
     "/api/v1/auth/recovery-session": {
       "post": {
         "summary": "recovery-session",

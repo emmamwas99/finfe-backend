@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -380,7 +381,7 @@ func validateSnapshotFields(s financeSnapshot) error {
 	}
 	validKind := map[string]bool{"need": true, "want": true, "debt": true, "invest": true, "saving": true, "income": true}
 	for _, c := range s.Categories {
-		if len(c.Name) < 1 || len(c.Name) > 60 || len(c.Emoji) > 16 || !validKind[c.Kind] {
+		if len(c.Name) < 1 || len(c.Name) > 60 || utf8.RuneCountInString(c.Emoji) > 16 || !validKind[c.Kind] {
 			return errors.New("invalid category")
 		}
 	}
@@ -390,7 +391,7 @@ func validateSnapshotFields(s financeSnapshot) error {
 		}
 	}
 	for _, g := range s.Goals {
-		if len(g.Name) < 1 || len(g.Name) > 100 || len(g.Emoji) > 16 || len(g.Note) > 1000 {
+		if len(g.Name) < 1 || len(g.Name) > 100 || utf8.RuneCountInString(g.Emoji) > 16 || len(g.Note) > 1000 {
 			return errors.New("invalid goal")
 		}
 	}

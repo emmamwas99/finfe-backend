@@ -36,6 +36,7 @@ type Config struct {
 	MailDriver   string // log | smtp
 	SMTPHost     string
 	SMTPPort     int
+	SMTPSecure   bool
 	SMTPUsername string
 	SMTPPassword string
 	MailFrom     string
@@ -73,6 +74,7 @@ func Load() (Config, error) {
 		MailDriver:               get("MAIL_DRIVER", "log"),
 		SMTPHost:                 get("SMTP_HOST", ""),
 		SMTPPort:                 getInt("SMTP_PORT", 587),
+		SMTPSecure:               getBool("SMTP_SECURE", getInt("SMTP_PORT", 587) == 465),
 		SMTPUsername:             get("SMTP_USERNAME", ""),
 		SMTPPassword:             get("SMTP_PASSWORD", ""),
 		MailFrom:                 get("MAIL_FROM", "Finfe <no-reply@localhost>"),

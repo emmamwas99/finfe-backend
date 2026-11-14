@@ -58,6 +58,7 @@ func (a *MongoAPI) Router() http.Handler {
 		r.Post("/billing/webhook", a.billingWebhook)
 		r.Post("/auth/register", a.register)
 		r.Post("/auth/login", a.login)
+		r.Post("/auth/resend-verification", a.resendVerification)
 		r.Post("/auth/refresh", a.refresh)
 		r.Post("/auth/forgot-password", a.forgotPassword)
 		r.Post("/auth/recovery-session", a.recoverySession)
@@ -183,7 +184,10 @@ func (a *MongoAPI) register(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		if a.cfg.RequireEmailVerification {
-			return a.authStore.CreateEmailVerification(tx, model.CreateEmailVerificationParams{TokenHash: verifyHash, UserID: uid, ExpiresAt: time.Now().UTC().Add(24 * time.Hour)})
+			if err := a.authStore.CreateEmailVerification(tx, model.CreateEmailVerificationParams{TokenHash: verifyHash, UserID: uid, ExpiresAt: time.Now().UTC().Add(24 * time.Hour)}); err != nil {
+				return err
+			}
+			return a.mail.Send(tx, email.Verification(a.cfg.AppURL, v.Email, v.Name, verifyToken))
 		}
 		return nil
 	})
@@ -197,9 +201,6 @@ func (a *MongoAPI) register(w http.ResponseWriter, r *http.Request) {
 	}
 	a.audit(r, uid, "account.register")
 	if a.cfg.RequireEmailVerification {
-		if err := a.mail.Send(r.Context(), email.Verification(a.cfg.AppURL, v.Email, v.Name, verifyToken)); err != nil {
-			a.log.Error("verification email failed", "error", err)
-		}
 		respond(w, 201, map[string]any{"user": publicUser(user), "needsConfirmation": true})
 		return
 	}
@@ -238,6 +239,32 @@ func (a *MongoAPI) login(w http.ResponseWriter, r *http.Request) {
 	}
 	a.audit(r, u.ID, "session.login")
 	respond(w, 200, map[string]any{"user": publicUser(u)})
+}
+
+// The response is the same for unknown and already-verified addresses.
+func (a *MongoAPI) resendVerification(w http.ResponseWriter, r *http.Request) {
+	if a.limited(w, r, "resend_verification") {
+		return
+	}
+	var v struct{ Email string }
+	if err := decode(r, &v); err != nil {
+		badJSON(w, err)
+		return
+	}
+	u, err := a.authStore.GetUserByEmail(r.Context(), strings.TrimSpace(v.Email))
+	if err == nil && u.EmailVerifiedAt == nil {
+		token, hash, sendErr := security.RandomToken()
+		if sendErr == nil {
+			sendErr = a.authStore.CreateEmailVerification(r.Context(), model.CreateEmailVerificationParams{TokenHash: hash, UserID: u.ID, ExpiresAt: time.Now().UTC().Add(24 * time.Hour)})
+		}
+		if sendErr == nil {
+			sendErr = a.mail.Send(r.Context(), email.Verification(a.cfg.AppURL, u.Email, u.Name, token))
+		}
+		if sendErr != nil {
+			a.log.Error("verification resend failed", "error", sendErr)
+		}
+	}
+	respond(w, 200, map[string]any{"ok": true})
 }
 
 func (a *MongoAPI) refresh(w http.ResponseWriter, r *http.Request) {

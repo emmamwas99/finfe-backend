@@ -3,6 +3,23 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# Load local settings as data, so URI query strings containing '&' are not
+# interpreted as shell syntax. The ignored override holds developer secrets.
+load_env() {
+  local file="$1" line key value
+  [[ -f "$file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "Invalid environment key in $file" >&2; return 1; }
+    if [[ "$value" == \"*\" || "$value" == \'*\' ]]; then value="${value:1:-1}"; fi
+    export "$key=$value"
+  done < "$file"
+}
+load_env .env
+load_env .env.local
+
 build_dir="$(mktemp -d "${TMPDIR:-/tmp}/finfe-dev.XXXXXX")"
 app_pid=""
 
@@ -26,7 +43,7 @@ trap cleanup EXIT
 fingerprint() {
   {
     find cmd internal -type f -name '*.go' -print
-    printf '%s\n' go.mod go.sum
+    printf '%s\n' go.mod go.sum .env .env.local
   } | LC_ALL=C sort | while IFS= read -r file; do
     [[ ! -f "$file" ]] || cksum "$file"
   done | cksum
@@ -34,11 +51,13 @@ fingerprint() {
 
 restart_app() {
   stop_app
+  load_env .env
+  load_env .env.local
   echo 'Building API...'
   if go build -o "$build_dir/finfe-api" ./cmd/api; then
     "$build_dir/finfe-api" &
     app_pid=$!
-    echo "API started (PID $app_pid). Watching Go files, go.mod, and go.sum."
+    echo "API started (PID $app_pid). Watching Go files, module files, and local settings."
   else
     echo 'Build failed. Waiting for another file change.' >&2
   fi

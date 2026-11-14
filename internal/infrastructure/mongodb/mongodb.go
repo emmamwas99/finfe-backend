@@ -71,6 +71,7 @@ func (d *Database) EnsureIndexes(ctx context.Context) error {
 		"user_sessions":             {{Keys: bson.D{{Key: "user_id", Value: 1}, {Key: "revoked_at", Value: 1}}}},
 		"refresh_tokens":            {{Keys: bson.D{{Key: "session_id", Value: 1}}}, {Keys: bson.D{{Key: "token_hash", Value: 1}}, Options: options.Index().SetUnique(true)}},
 		"email_verifications":       {{Keys: bson.D{{Key: "user_id", Value: 1}}}, {Keys: bson.D{{Key: "token_hash", Value: 1}}, Options: options.Index().SetUnique(true)}},
+		"mail_outbox":               {{Keys: bson.D{{Key: "status", Value: 1}, {Key: "next_attempt_at", Value: 1}, {Key: "created_at", Value: 1}}}},
 		"password_resets":           {{Keys: bson.D{{Key: "user_id", Value: 1}}}, {Keys: bson.D{{Key: "token_hash", Value: 1}}, Options: options.Index().SetUnique(true)}},
 		"audit_events":              {{Keys: bson.D{{Key: "user_id", Value: 1}, {Key: "created_at", Value: -1}}}},
 		"categories":                {{Keys: bson.D{{Key: "user_id", Value: 1}, {Key: "created_at", Value: -1}}}},

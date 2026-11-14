@@ -38,7 +38,10 @@ func main() {
 	}
 	var mail email.Mailer = &email.Log{Logger: log}
 	if cfg.MailDriver == "smtp" {
-		mail = email.SMTP{Host: cfg.SMTPHost, Port: cfg.SMTPPort, Username: cfg.SMTPUsername, Password: cfg.SMTPPassword, From: cfg.MailFrom}
+		transport := email.SMTP{Host: cfg.SMTPHost, Port: cfg.SMTPPort, Secure: cfg.SMTPSecure, Username: cfg.SMTPUsername, Password: cfg.SMTPPassword, From: cfg.MailFrom}
+		outbox := email.NewOutbox(db.DB, transport, cfg.JWTSecret, log)
+		go outbox.Run(ctx)
+		mail = outbox
 	}
 	api := httpapi.NewMongo(cfg, db, mail, log)
 	go func() {
